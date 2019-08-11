@@ -9,13 +9,5 @@ runAndCheck := {
 
   val bin = (Compile / nativeLink).value
   val out = Process(bin.getAbsolutePath).lines_!.toList
-  assert(
-    out == List(
-      "start main",
-      "end main",
-      "future 1",
-      "future 2",
-      "future 3",
-      "result: 10"
-    ))
+  assert(out == List("result: 10"))
 }
