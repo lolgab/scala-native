@@ -565,7 +565,7 @@ lazy val testingCompiler =
         "org.scala-lang" % "scala-reflect"  % scalaVersion.value
       )
     )
-    .dependsOn(testingCompilerInterface, nativelib)
+    .dependsOn(testingCompilerInterface, nativelib, runtime)
 
 lazy val testInterface =
   project
