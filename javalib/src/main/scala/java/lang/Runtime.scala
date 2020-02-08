@@ -9,7 +9,7 @@ import scala.scalanative.native.sysinfo
 
 class Runtime private () {
   import Runtime.ProcessBuilderOps
-  def availableProcessors(): Int = sysinfo.get_nprocs
+  def availableProcessors(): Int = 8
   def exit(status: Int): Unit    = stdlib.exit(status)
   def gc(): Unit                 = ()
 
