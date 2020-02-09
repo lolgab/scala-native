@@ -77,7 +77,6 @@ void Marker_Mark(Heap *heap, Stack *stack) {
 }
 
 void Marker_markProgramStack(Heap *heap, Stack *stack) {
-    ThreadManager_SuspendAllThreads();
     // Dumps registers into 'regs' which is on stack
     jmp_buf regs;
     setjmp(regs);
@@ -95,7 +94,6 @@ void Marker_markProgramStack(Heap *heap, Stack *stack) {
             current += 1;
         }
     }
-    ThreadManager_ResumeAllThreads();
 }
 
 void Marker_markModules(Heap *heap, Stack *stack) {
@@ -115,10 +113,13 @@ void Marker_markModules(Heap *heap, Stack *stack) {
 }
 
 void Marker_MarkRoots(Heap *heap, Stack *stack) {
+    ThreadManager_SuspendAllThreads();
 
     Marker_markProgramStack(heap, stack);
 
     Marker_markModules(heap, stack);
 
     Marker_Mark(heap, stack);
+
+    ThreadManager_ResumeAllThreads();
 }

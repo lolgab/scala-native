@@ -41,9 +41,9 @@ INLINE void *scalanative_alloc(void *info, size_t size) {
 }
 
 INLINE void *scalanative_alloc_small(void *info, size_t size) {
-    pthread_mutex_lock(&mutex);
     size = MathUtils_RoundToNextMultiple(size, ALLOCATION_ALIGNMENT);
 
+    pthread_mutex_lock(&mutex);
     void **alloc = (void **)Heap_AllocSmall(&heap, size);
     *alloc = info;
     pthread_mutex_unlock(&mutex);
