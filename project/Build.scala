@@ -110,23 +110,24 @@ object Build {
       )
 
   // Compiler plugins
-  lazy val nscPlugin: MultiScalaProject = MultiScalaProject("nscplugin", file("nscplugin"))
-    .settings(
-      compilerPluginSettings,
-      scalacOptions ++= scalaVersionsDependendent(scalaVersion.value)(
-        Seq.empty[String]
-      ) {
-        case (2, _) => Seq("-Xno-patmat-analysis")
+  lazy val nscPlugin: MultiScalaProject =
+    MultiScalaProject("nscplugin", file("nscplugin"))
+      .settings(
+        compilerPluginSettings,
+        scalacOptions ++= scalaVersionsDependendent(scalaVersion.value)(
+          Seq.empty[String]
+        ) {
+          case (2, _) => Seq("-Xno-patmat-analysis")
+        }
+      )
+      .mapBinaryVersions {
+        // Scaladoc for Scala 2.12 does not handle literal constants correctly
+        // It does not allow integer contstant < 255 to be passed as arugment of function taking byte
+        case "2.12" => _.settings(disabledDocsSettings)
+        case _      => identity
       }
-    )
-    .mapBinaryVersions {
-      // Scaladoc for Scala 2.12 does not handle literal constants correctly
-      // It does not allow integer contstant < 255 to be passed as arugment of function taking byte
-      case "2.12" => _.settings(disabledDocsSettings)
-      case _      => identity
-    }
-    .dependsOnSource(nir)
-    .dependsOnSource(util)
+      .dependsOnSource(nir)
+      .dependsOnSource(util)
 
   lazy val junitPlugin = MultiScalaProject("junitPlugin", file("junit-plugin"))
     .settings(compilerPluginSettings)
