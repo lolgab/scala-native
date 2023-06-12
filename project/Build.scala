@@ -24,7 +24,7 @@ object Build {
   import Deps._
 
 // format: off
-  lazy val compilerPlugins =  List(nscPlugin, junitPlugin)
+  lazy val compilerPlugins: List[MultiScalaProject] =  List(nscPlugin, junitPlugin)
   lazy val publishedMultiScalaProjects = compilerPlugins ++ List(
     nir, util, tools,
     nativelib, clib, posixlib, windowslib,
@@ -110,7 +110,7 @@ object Build {
       )
 
   // Compiler plugins
-  lazy val nscPlugin = MultiScalaProject("nscplugin", file("nscplugin"))
+  lazy val nscPlugin: MultiScalaProject = MultiScalaProject("nscplugin", file("nscplugin"))
     .settings(
       compilerPluginSettings,
       scalacOptions ++= scalaVersionsDependendent(scalaVersion.value)(
