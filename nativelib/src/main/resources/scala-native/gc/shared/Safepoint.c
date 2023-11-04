@@ -27,7 +27,7 @@ void Safepoint_init(safepoint_t *ref) {
         mmap(NULL, sizeof(safepoint_t), PROT_READ,
              MAP_NORESERVE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #endif
-    if (addr > (void *)0) {
+    if (LIKELY(addr > (void *)0)) {
         *ref = addr;
     } else {
         perror("Failed to create GC safepoint trap");
@@ -63,7 +63,7 @@ void Safepoint_arm(safepoint_t ref) {
 #else
     success = mprotect((void *)ref, sizeof(safepoint_t), PROT_NONE) == 0;
 #endif
-    if (!success) {
+    if (UNLIKELY(!success)) {
         perror("Failed to enable GC collect trap");
         exit(errno);
     }
@@ -78,7 +78,7 @@ void Safepoint_disarm(safepoint_t ref) {
 #else
     success = mprotect((void *)ref, sizeof(safepoint_t), PROT_READ) == 0;
 #endif
-    if (!success) {
+    if (UNLIKELY(!success)) {
         perror("Failed to disable GC collect trap");
         exit(errno);
     }

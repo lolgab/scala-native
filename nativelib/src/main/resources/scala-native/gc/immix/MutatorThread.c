@@ -18,7 +18,7 @@ void MutatorThread_init(Field_t *stackbottom) {
     self->stackBottom = stackbottom;
 #ifdef _WIN32
     self->wakeupEvent = CreateEvent(NULL, true, false, NULL);
-    if (self->wakeupEvent == NULL) {
+    if (UNLIKELY(self->wakeupEvent == NULL)) {
         fprintf(stderr, "Failed to setup mutator thread: errno=%lu\n",
                 GetLastError());
         exit(1);

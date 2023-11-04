@@ -83,7 +83,7 @@ static void SetupPageFaultHandler() {
     sigemptyset(&sa.sa_mask);
     sa.sa_sigaction = &SafepointTrapHandler;
     sa.sa_flags = SA_SIGINFO | SA_RESTART;
-    if (sigaction(SAFEPOINT_TRAP_SIGNAL, &sa, &defaultAction) == -1) {
+    if (UNLIKELY(sigaction(SAFEPOINT_TRAP_SIGNAL, &sa, &defaultAction) == -1)) {
         perror("Error: cannot setup safepoint synchronization handler");
         exit(errno);
     }
@@ -96,13 +96,13 @@ static void Synchronizer_SuspendThread(MutatorThread *thread) {
     if (!ResetEvent(thread->wakeupEvent)) {
         fprintf(stderr, "Failed to reset event %lu\n", GetLastError());
     }
-    if (WAIT_OBJECT_0 != WaitForSingleObject(thread->wakeupEvent, INFINITE)) {
+    if (UNLIKELY(WAIT_OBJECT_0 != WaitForSingleObject(thread->wakeupEvent, INFINITE))) {
         fprintf(stderr, "Error: suspend thread");
         exit(GetLastError());
     }
 #else
     int signum;
-    if (0 != sigwait(&threadWakupSignals, &signum)) {
+    if (UNLIKELY(0 != sigwait(&threadWakupSignals, &signum))) {
         perror("Error: sig wait");
         exit(errno);
     }

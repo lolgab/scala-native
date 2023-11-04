@@ -90,7 +90,7 @@ INLINE Stats *Heap_createStatsForThread(int id) {
 void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
     size_t memoryLimit = Heap_getMemoryLimit();
 
-    if (maxHeapSize < MIN_HEAP_SIZE) {
+    if (UNLIKELY(maxHeapSize < MIN_HEAP_SIZE)) {
         fprintf(stderr, "GC_MAXIMUM_HEAP_SIZE too small to initialize heap.\n");
         fprintf(stderr, "Minimum required: %zum \n",
                 (size_t)(MIN_HEAP_SIZE / 1024 / 1024));
@@ -98,7 +98,7 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
         exit(1);
     }
 
-    if (minHeapSize > memoryLimit) {
+    if (UNLIKELY(minHeapSize > memoryLimit)) {
         fprintf(stderr, "GC_INITIAL_HEAP_SIZE is too large.\n");
         fprintf(stderr, "Maximum possible: %zug \n",
                 memoryLimit / 1024 / 1024 / 1024);
@@ -106,7 +106,7 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
         exit(1);
     }
 
-    if (maxHeapSize < minHeapSize) {
+    if (UNLIKELY(maxHeapSize < minHeapSize)) {
         fprintf(stderr, "GC_MAXIMUM_HEAP_SIZE should be at least "
                         "GC_INITIAL_HEAP_SIZE\n");
         fflush(stderr);
@@ -179,7 +179,7 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
         // chunk of memory. Additional chunks of heap should be committed on
         // demend when growing the heap.
         memoryCommit(heapStart, minHeapSize);
-    if (!commitStatus) {
+    if (UNLIKELY(!commitStatus)) {
         Heap_exitWithOutOfMemory();
     }
 #endif // _WIN32
@@ -285,14 +285,14 @@ void Heap_GrowIfNeeded(Heap *heap) {
             }
         }
     }
-    if (!Allocator_CanInitCursors(&allocator)) {
+    if (UNLIKELY(!Allocator_CanInitCursors(&allocator))) {
         Heap_exitWithOutOfMemory();
     }
 }
 
 void Heap_Grow(Heap *heap, uint32_t incrementInBlocks) {
     mutex_lock(&heap->sweep.growMutex);
-    if (!Heap_isGrowingPossible(heap, incrementInBlocks)) {
+    if (UNLIKELY(!Heap_isGrowingPossible(heap, incrementInBlocks))) {
         Heap_exitWithOutOfMemory();
     }
     size_t incrementInBytes = incrementInBlocks * SPACE_USED_PER_BLOCK;
@@ -318,7 +318,7 @@ void Heap_Grow(Heap *heap, uint32_t incrementInBlocks) {
     // might take over all available memory leading to OutOfMemory errors for
     // other processes. Also when using UNLIMITED heap size it might try to
     // commit more memory than is available.
-    if (!memoryCommit(heapEnd, incrementInBytes)) {
+    if (UNLIKELY(!memoryCommit(heapEnd, incrementInBytes))) {
         Heap_exitWithOutOfMemory();
     };
 #endif // WIN32

@@ -58,7 +58,7 @@ word_t *Heap_mapAndAlign(size_t memoryLimit, size_t alignmentSize) {
 void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
     size_t memoryLimit = Heap_getMemoryLimit();
 
-    if (maxHeapSize < MIN_HEAP_SIZE) {
+    if (UNLIKELY(maxHeapSize < MIN_HEAP_SIZE)) {
         fprintf(stderr, "GC_MAXIMUM_HEAP_SIZE too small to initialize heap.\n");
         fprintf(stderr, "Minimum required: %zum \n",
                 (size_t)(MIN_HEAP_SIZE / 1024 / 1024));
@@ -66,7 +66,7 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
         exit(1);
     }
 
-    if (minHeapSize > memoryLimit) {
+    if (UNLIKELY(minHeapSize > memoryLimit)) {
         fprintf(stderr, "GC_INITIAL_HEAP_SIZE is too large.\n");
         fprintf(stderr, "Maximum possible: %zug \n",
                 memoryLimit / 1024 / 1024 / 1024);
@@ -74,7 +74,7 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
         exit(1);
     }
 
-    if (maxHeapSize < minHeapSize) {
+    if (UNLIKELY(maxHeapSize < minHeapSize)) {
         fprintf(stderr, "GC_MAXIMUM_HEAP_SIZE should be at least "
                         "GC_INITIAL_HEAP_SIZE\n");
         fflush(stderr);
@@ -136,7 +136,7 @@ void Heap_Init(Heap *heap, size_t minHeapSize, size_t maxHeapSize) {
         // chunk of memory. Additional chunks of heap should be committed on
         // demand when growing the heap.
         memoryCommit(heapStart, minHeapSize);
-    if (!commitStatus) {
+    if (UNLIKELY(!commitStatus)) {
         Heap_exitWithOutOfMemory("commit memmory");
     }
 #endif // _WIN32
@@ -191,7 +191,7 @@ word_t *Heap_AllocLarge(Heap *heap, uint32_t size) {
                     return (word_t *)object;
                 }
             }
-        } while (Heap_isGrowingPossible(heap, pow2increment));
+        } while (LIKELY(Heap_isGrowingPossible(heap, pow2increment)));
         Heap_exitWithOutOfMemory("Cannot grow heap to allocate large object");
         return NULL;
     }
@@ -218,7 +218,7 @@ NOINLINE word_t *Heap_allocSmallSlow(Heap *heap, uint32_t size) {
         object = (Object *)Allocator_Alloc(allocator, size);
         if (object != NULL)
             goto done;
-    } while (Heap_isGrowingPossible(heap, 1));
+    } while (LIKELY(Heap_isGrowingPossible(heap, 1)));
     Heap_exitWithOutOfMemory("alloc-small cannot grow");
 
 done:
@@ -396,7 +396,7 @@ void Heap_Recycle(Heap *heap) {
     BlockAllocator_SweepDone(&blockAllocator);
     MutatorThreads_foreach(mutatorThreads, node) {
         MutatorThread *thread = node->value;
-        if (!Allocator_CanInitCursors(&thread->allocator)) {
+        if (UNLIKELY(!Allocator_CanInitCursors(&thread->allocator))) {
             Heap_exitWithOutOfMemory("re-init cursors");
         }
         Allocator_InitCursors(&thread->allocator);
@@ -405,7 +405,7 @@ void Heap_Recycle(Heap *heap) {
 
 void Heap_Grow(Heap *heap, uint32_t incrementInBlocks) {
     BlockAllocator_Acquire(&blockAllocator);
-    if (!Heap_isGrowingPossible(heap, incrementInBlocks)) {
+    if (UNLIKELY(!Heap_isGrowingPossible(heap, incrementInBlocks))) {
         Heap_exitWithOutOfMemory("grow heap");
     }
     size_t incrementInBytes = incrementInBlocks * SPACE_USED_PER_BLOCK;
@@ -431,7 +431,7 @@ void Heap_Grow(Heap *heap, uint32_t incrementInBlocks) {
     // might take over all available memory leading to OutOfMemory errors for
     // other processes. Also when using UNLIMITED heap size it might try to
     // commit more memory than is available.
-    if (!memoryCommit(heapEnd, incrementInBytes)) {
+    if (UNLIKELY(!memoryCommit(heapEnd, incrementInBytes))) {
         Heap_exitWithOutOfMemory("commit memory");
     };
 #endif // WIN32
