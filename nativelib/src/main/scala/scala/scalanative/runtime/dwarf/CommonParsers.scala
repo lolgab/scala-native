@@ -22,7 +22,7 @@ private[runtime] object CommonParsers {
     val v = stream.readUnsignedShort()
     endi match {
       case LITTLE =>
-        ((v >>> 8) | ((v & 0xff.toUShort) << 8)).toUShort
+        java.lang.Short.reverseBytes(v).toUShort
       case BIG =>
         v
     }
@@ -32,10 +32,7 @@ private[runtime] object CommonParsers {
     val v = stream.readInt()
     endi match {
       case LITTLE =>
-        (v >>> 24 & 0xff |
-          v >>> 8 & 0xff00 |
-          v << 8 & 0xff0000 |
-          v << 24 & 0xff000000).toUInt
+        java.lang.Integer.reverseBytes(v).toUInt
       case BIG =>
         v.toUInt
     }
@@ -45,14 +42,7 @@ private[runtime] object CommonParsers {
     val v = stream.readLong()
     endi match {
       case LITTLE =>
-        (v << 56) |
-          ((v & 0xff00L) << 40) |
-          ((v & 0xff0000L) << 24) |
-          ((v & 0xff000000L) << 8) |
-          ((v >> 8) & 0xff000000L) |
-          ((v >> 24) & 0xff0000L) |
-          ((v >> 40) & 0xff00L) |
-          (v >>> 56)
+        java.lang.Long.reverseBytes(v)
       case BIG =>
         v
     }
