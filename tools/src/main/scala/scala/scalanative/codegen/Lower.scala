@@ -57,7 +57,16 @@ private[scalanative] object Lower {
       blockInfo.getOrElseUpdate(currentBlock, new BlockInfo())
     }
     class BlockInfo(
-        val nullGuardedVals: mutable.Set[nir.Val] = mutable.Set.empty
+        val nullGuardedVals: mutable.Set[nir.Val] = mutable.Set.empty,
+        // Values known to be an instance of a concrete RefKind type at block
+        // entry. Populated whenever the block is the then-target of an
+        // `If(Op.Is(T, v), thenL, elseL)`: along that edge we know
+        // `v ne null && v is T`. Used in `genAsOp` to elide the redundant
+        // null check + type-id load + icmp that would otherwise expand into
+        // a multi-block CFG for an `x.asInstanceOf[T]` that is dominated by
+        // a matching `x.isInstanceOf[T]` test.
+        val typeGuardedVals: mutable.Map[nir.Val, mutable.Set[nir.Type.RefKind]] =
+          mutable.Map.empty
     )
     private def findNonRecursive(
         current: Block,
@@ -79,6 +88,55 @@ private[scalanative] object Lower {
         currentBlock.pred.nonEmpty && currentBlock.pred.forall {
           findNonRecursive(_, isHandled).isDefined
         }
+    }
+    // Returns true if `v` is known to be an instance of `ty` (or of a subtype
+    // of `ty`) at the current point. Mirrors `isNullGuarded`: the fact holds
+    // either in the current block or transitively through every predecessor.
+    def isTypeGuarded(
+        currentBlock: Block,
+        v: nir.Val,
+        ty: nir.Type.RefKind
+    ): Boolean = {
+      def isHandled(block: BlockInfo): Boolean =
+        block.typeGuardedVals.get(v).exists { guards =>
+          guards.exists(t => t == ty || Sub.is(t, ty))
+        }
+      blockInfo.get(currentBlock).exists(isHandled) ||
+        currentBlock.pred.nonEmpty && currentBlock.pred.forall {
+          findNonRecursive(_, isHandled).isDefined
+        }
+    }
+    // On entry to `block`, detect the common "cast after dominating type
+    // check" pattern: every incoming edge terminates with
+    // `If(cond, thenTarget, _)` where `cond` is defined by
+    // `Let(_, Op.Is(T, v), _)` and `block` is the then-target. On every such
+    // edge we know `v ne null && v is T`. If all predecessors agree on the
+    // same `(v, T)` we record it in the block's `BlockInfo` so that any
+    // downstream `Op.As(T, v)` lowers to a bare bitcast/copy.
+    private def populateGuardsFromPredecessors(block: Block): Unit = {
+      if (block.isEntry || block.inEdges.isEmpty) return
+      val fromEdges = block.inEdges.toSeq.map { edge =>
+        val from = edge.from
+        val viaThen: Option[nir.Local] = from.insts.lastOption match {
+          case Some(nir.Inst.If(nir.Val.Local(condLocal, _), thenNext, _))
+              if thenNext.id == block.id =>
+            Some(condLocal)
+          case _ => None
+        }
+        viaThen.flatMap { condLocal =>
+          from.insts.collectFirst {
+            case nir.Inst.Let(`condLocal`, nir.Op.Is(ty: nir.Type.RefKind, v), _) =>
+              (v, ty)
+          }
+        }
+      }
+      val first = fromEdges.headOption.flatten
+      if (first.isDefined && fromEdges.forall(_ == first)) {
+        val (v, ty) = first.get
+        val info = blockInfo.getOrElseUpdate(block, new BlockInfo())
+        info.nullGuardedVals += v
+        info.typeGuardedVals.getOrElseUpdate(v, mutable.Set.empty) += ty
+      }
     }
 
     private def currentDefnRetType = {
@@ -287,6 +345,7 @@ private[scalanative] object Lower {
                 isEntry = false
               )(inst.pos)
             }
+          populateGuardsFromPredecessors(currentBlock)
           buf += inst
 
         case inst =>
@@ -1331,26 +1390,49 @@ private[scalanative] object Lower {
 
         case nir.Op.As(ty: nir.Type.RefKind, obj) if obj.ty.isInstanceOf[nir.Type.RefKind] =>
           val v = genVal(buf, obj)
-          val checkIfIsInstanceOfL, castL = fresh()
-          val failL = classCastSlowPath.getOrElseUpdate(unwindHandler, fresh())
+          // Fast path: a dominating `Op.Is(ty, v)` branch (or a prior
+          // dominating `asInstanceOf[ty]`) already proved that `v` is
+          // non-null and an instance of `ty`. Emit just the bitcast/copy
+          // and let the rest of the null/type check slow path disappear.
+          if (isTypeGuarded(currentBlock, v, ty)) {
+            if (platform.useOpaquePointers)
+              let(n, nir.Op.Copy(v), unwind)
+            else
+              let(n, nir.Op.Conv(nir.Conv.Bitcast, ty, v), unwind)
+            // Record the guard in the current block so a subsequent
+            // `As(ty, v)` in the same block keeps using the fast path.
+            val info = getCurrentBlockInfo
+            info.nullGuardedVals += v
+            info.typeGuardedVals.getOrElseUpdate(v, mutable.Set.empty) += ty
+          } else {
+            val checkIfIsInstanceOfL, castL = fresh()
+            val failL = classCastSlowPath.getOrElseUpdate(unwindHandler, fresh())
 
-          val isNull = comp(nir.Comp.Ieq, v.ty, v, nir.Val.Null, unwind)
-          branch(isNull, nir.Next(castL), nir.Next(checkIfIsInstanceOfL))
+            val isNull = comp(nir.Comp.Ieq, v.ty, v, nir.Val.Null, unwind)
+            branch(isNull, nir.Next(castL), nir.Next(checkIfIsInstanceOfL))
 
-          label(checkIfIsInstanceOfL)
-          val isInstanceOf = genIsOp(buf, ty, v)
-          val toTy = rtti(analysis.infos(ty.className)).const
-          branch(
-            isInstanceOf,
-            nir.Next(castL),
-            nir.Next.Label(failL, Seq(v, toTy))
-          )
+            label(checkIfIsInstanceOfL)
+            val isInstanceOf = genIsOp(buf, ty, v)
+            val toTy = rtti(analysis.infos(ty.className)).const
+            branch(
+              isInstanceOf,
+              nir.Next(castL),
+              nir.Next.Label(failL, Seq(v, toTy))
+            )
 
-          label(castL)
-          if (platform.useOpaquePointers)
-            let(n, nir.Op.Copy(v), unwind)
-          else
-            let(n, nir.Op.Conv(nir.Conv.Bitcast, ty, v), unwind)
+            label(castL)
+            if (platform.useOpaquePointers)
+              let(n, nir.Op.Copy(v), unwind)
+            else
+              let(n, nir.Op.Conv(nir.Conv.Bitcast, ty, v), unwind)
+            // Once the check has passed, `v` is also known to be non-null
+            // and of type `ty` for the remainder of this block: record
+            // both guards so any later `Op.As(ty, v)` or `genGuardNotNull`
+            // in this block can take the fast path.
+            val info = getCurrentBlockInfo
+            info.nullGuardedVals += v
+            info.typeGuardedVals.getOrElseUpdate(v, mutable.Set.empty) += ty
+          }
 
         case nir.Op.As(to, v) =>
           util.unsupported(s"can't cast from ${v.ty} to $to")
