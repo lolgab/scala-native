@@ -2360,21 +2360,47 @@ trait NirGenExpr[G <: nsc.Global with Singleton] { self: NirGenPhase[G] =>
 
       val self = genExpr(receiverp)
       val retType = genType(paramTypes.last)
-      val unboxedRetType = nir.Type.unbox.getOrElse(retType, retType)
+      val isStructRet = isFullyResolvedStruct(paramTypes.last)
+      val unboxedRetType =
+        if (isStructRet) genExternType(paramTypes.last)
+        else nir.Type.unbox.getOrElse(retType, retType)
 
       val args = aargs
         .zip(paramTypes)
         .map {
           case (arg, ty) =>
-            val tpe = genType(ty)
             val obj = genExpr(arg)
 
-            /* buf.unboxValue does not handle Ref( Ptr | CArray | ... ) unboxing
-             * That's why we're doing it directly */
-            if (nir.Type.unbox.isDefinedAt(tpe)) {
-              buf.unbox(tpe, obj, unwind)(arg.pos, getScopeId)
+            if (isFullyResolvedStruct(ty)) {
+              // Don't derive the wrapper class from `obj`'s own inferred
+              // NIR type as `toExtern` normally does: `arg` is often an
+              // implicit `Ptr.ptrToCStruct(...)` conversion call whose
+              // generic return type erases to the bare `CStruct` bound,
+              // not the concrete `CStructN` - even though the value it
+              // produces genuinely is one. Build the field lookup from
+              // the statically-known `ty` (from the call's evidence
+              // types) instead, which always names the concrete class.
+              val externTy = genExternType(ty)
+              val refty = genType(ty).asInstanceOf[nir.Type.Ref]
+              val rawptrSig = refty.name.member(
+                nir.Sig.Field("rawptr", nir.Sig.Scope.Private(refty.name))
+              )
+              val casted = buf.as(refty, obj, unwind)(arg.pos, getScopeId)
+              val rawptr =
+                buf.fieldload(nir.Type.Ptr, casted, rawptrSig, unwind)(
+                  arg.pos,
+                  getScopeId
+                )
+              buf.load(externTy, rawptr, unwind)(arg.pos, getScopeId)
             } else {
-              buf.unboxValue(ty, partial = false, obj)(arg.pos)
+              val tpe = genType(ty)
+              /* buf.unboxValue does not handle Ref( Ptr | CArray | ... ) unboxing
+               * That's why we're doing it directly */
+              if (nir.Type.unbox.isDefinedAt(tpe)) {
+                buf.unbox(tpe, obj, unwind)(arg.pos, getScopeId)
+              } else {
+                buf.unboxValue(ty, partial = false, obj)(arg.pos)
+              }
             }
         }
       val argTypes = args.map(_.ty)
@@ -2386,7 +2412,8 @@ trait NirGenExpr[G <: nsc.Global with Singleton] { self: NirGenPhase[G] =>
 
       val target = buf.fieldload(nir.Type.Ptr, self, getRawPtrName, unwind)
       val result = buf.call(funcSig, target, args, unwind)
-      if (retType != unboxedRetType)
+      if (isStructRet) fromExtern(retType, result)
+      else if (retType != unboxedRetType)
         buf.box(retType, result, unwind)
       else {
         boxValue(paramTypes.last, result)
@@ -3005,6 +3032,12 @@ trait NirGenExpr[G <: nsc.Global with Singleton] { self: NirGenPhase[G] =>
             if nir.Type.boxClasses.contains(refty.name)
               && nir.Type.unbox(nir.Type.Ref(refty.name)) == expectedTy =>
           buf.unbox(nir.Type.Ref(refty.name), value, unwind)
+        case (structTy: nir.Type.StructValue, refty: nir.Type.Ref) =>
+          val rawptrSig = refty.name.member(
+            nir.Sig.Field("rawptr", nir.Sig.Scope.Private(refty.name))
+          )
+          val rawptr = buf.fieldload(nir.Type.Ptr, value, rawptrSig, unwind)
+          buf.load(structTy, rawptr, unwind)
         case _ =>
           value
       }
@@ -3017,6 +3050,20 @@ trait NirGenExpr[G <: nsc.Global with Singleton] { self: NirGenPhase[G] =>
             if nir.Type.boxClasses.contains(refty.name)
               && nir.Type.unbox(nir.Type.Ref(refty.name)) == ty =>
           buf.box(nir.Type.Ref(refty.name), value, unwind)
+        case (refty: nir.Type.Ref, structTy: nir.Type.StructValue) =>
+          val buffer = buf.stackalloc(structTy, nir.Val.Size(1), unwind)
+          buf.store(structTy, buffer, value, unwind)
+          val alloc = buf.classalloc(refty.name, unwind)
+          val ctorTy =
+            nir.Type.Function(Seq(refty, nir.Type.Ptr), nir.Type.Unit)
+          val ctorName = refty.name.member(nir.Sig.Ctor(Seq(nir.Type.Ptr)))
+          buf.call(
+            ctorTy,
+            nir.Val.Global(ctorName, nir.Type.Ptr),
+            Seq(alloc, buffer),
+            unwind
+          )
+          alloc
         case _ =>
           value
       }
@@ -3069,16 +3116,42 @@ trait NirGenExpr[G <: nsc.Global with Singleton] { self: NirGenPhase[G] =>
     ): Seq[nir.Val] = {
       val res = Seq.newBuilder[nir.Val]
       val nir.Type.Function(argTypes, _) = genExternMethodSig(sym)
-      val paramSyms = sym.tpe.params
+      // sym.tpe queried at the current (post-erasure) phase loses type
+      // arguments for ground generic types like `CStruct2[Long, Long]`
+      // (they come back as the bare, unapplied class type). Re-reading it
+      // as it was at typer recovers them, but is only attempted in the one
+      // narrow case that needs it - see
+      // NirGenType.externReturnNirType's doc for why going back to typer
+      // isn't safe in general.
+      val erasedParamTypes = sym.tpe.params.map(_.tpe)
+      val needsRecovery = !erasedParamTypes.forall(t =>
+        !t.typeSymbol.isAnonymousStruct || isFullyResolvedStruct(t)
+      )
+      // Compute the *entire* NIR param type list while still "at" typer,
+      // not just the dealias: genExternType/genAnonymousStruct recurse
+      // into field types, and those nested lookups are just as phase-
+      // sensitive as the top-level one - see NirGenType.externReturnNirType's
+      // doc for why going back to typer isn't safe in general.
+      val precomputedExternTypes: Option[Seq[nir.Type]] =
+        if (!needsRecovery) None
+        else
+          exitingPhase(currentRun.typerPhase) {
+            val ts = sym.tpe.params.map(_.tpe.dealiasWiden)
+            if (ts.size != erasedParamTypes.size || ts.exists(hasFreeTypeParam))
+              None
+            else Some(ts.map(genExternType))
+          }
+      val paramTypes = erasedParamTypes
       assert(
-        argTypes.size == argsp.size && argTypes.size == paramSyms.size,
+        argTypes.size == argsp.size && argTypes.size == paramTypes.size,
         "Different number of arguments passed to method signature and apply method"
       )
 
       def genArg(
           argp: Tree,
           paramTpe: global.Type,
-          isVarArg: Boolean = false
+          isVarArg: Boolean = false,
+          precomputedExternTy: Option[nir.Type] = None
       ): nir.Val = {
         implicit def pos: nir.SourcePosition =
           argp.pos.orElse(fallbackSourcePosition)
@@ -3087,7 +3160,8 @@ trait NirGenExpr[G <: nsc.Global with Singleton] { self: NirGenPhase[G] =>
         val maybeUnboxed =
           if (isVarArg) ensureUnboxed(rawValue, paramTpe.finalResultType)
           else rawValue
-        val externType = genExternType(paramTpe.finalResultType)
+        val externType =
+          precomputedExternTy.getOrElse(genExternType(paramTpe.finalResultType))
         val value = (maybeUnboxed, nir.Type.box.get(externType)) match {
           case (value @ nir.Val.Null, Some(unboxedType)) =>
             externType match {
@@ -3105,7 +3179,7 @@ trait NirGenExpr[G <: nsc.Global with Singleton] { self: NirGenPhase[G] =>
         toExtern(externType, value)
       }
 
-      for (((argp, sigType), paramSym) <- argsp zip argTypes zip paramSyms) {
+      for ((((argp, sigType), paramTpe), i) <- (argsp zip argTypes zip paramTypes).zipWithIndex) {
         sigType match {
           case nir.Type.Vararg =>
             argp match {
@@ -3147,7 +3221,9 @@ trait NirGenExpr[G <: nsc.Global with Singleton] { self: NirGenPhase[G] =>
                   "Unable to extract vararg arguments, varargs to extern methods must be passed directly to the applied function"
                 )
             }
-          case _ => res += genArg(argp, paramSym.tpe)
+          case _ =>
+            val precomputedExternTy = precomputedExternTypes.map(_(i))
+            res += genArg(argp, paramTpe, precomputedExternTy = precomputedExternTy)
         }
       }
       res.result()

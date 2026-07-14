@@ -677,6 +677,11 @@ object Show {
         rep(tys, sep = ", ")(onType)
         str("}")
 
+      case Type.StructReturn(underlying) =>
+        str("sret[")
+        onType(underlying)
+        str("]")
+
       case Type.Null                => str("null")
       case Type.Nothing             => str("nothing")
       case Type.Virtual             => str("virtual")

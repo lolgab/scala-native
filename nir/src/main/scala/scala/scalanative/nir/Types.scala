@@ -180,6 +180,15 @@ object Type {
   final case class Var(ty: Type) extends SpecialKind
   final case class Function(args: Seq[Type], ret: Type) extends SpecialKind
 
+  /** Marker type used only as the leading parameter of an ABI-lowered extern
+   *  function whose true return type is a large-by-value `underlying`
+   *  struct. Printed as `ptr sret(<underlying>)`; the function's actual LLVM
+   *  return type becomes `void`. Introduced post-nscplugin by the extern ABI
+   *  lowering pass (`codegen.Lower`), never produced by the frontend.
+   */
+  final case class StructReturn(underlying: Type.StructValue)
+      extends SpecialKind
+
   object unsigned {
     val Size = Type.Ref(Global.Top("scala.scalanative.unsigned.USize"))
     val Byte = Type.Ref(Global.Top("scala.scalanative.unsigned.UByte"))

@@ -3,7 +3,7 @@ package scala.scalanative.codegen
 import scala.scalanative.build.{Config, Discover}
 
 private[scalanative] case class PlatformInfo(
-    targetTriple: Option[String],
+    targetTriple: String,
     targetsWindows: Boolean,
     is32Bit: Boolean,
     isMultithreadingEnabled: Boolean,
@@ -16,7 +16,12 @@ private[scalanative] case class PlatformInfo(
 }
 private[scalanative] object PlatformInfo {
   def apply(config: Config): PlatformInfo = PlatformInfo(
-    targetTriple = config.compilerConfig.targetTriple,
+    // `compilerConfig.targetTriple` is only set when the user explicitly
+    // configures a cross-target triple; absent that, we must still resolve
+    // to whatever clang would use by default (i.e. the host triple) -
+    // otherwise ABI classification (codegen.abi.StructABI) silently
+    // defaults to the wrong platform family.
+    targetTriple = config.compilerConfig.configuredOrDetectedTriple.toString,
     targetsWindows = config.targetsWindows,
     is32Bit = config.compilerConfig.is32BitPlatform,
     isMultithreadingEnabled = config.compilerConfig.multithreadingSupport,

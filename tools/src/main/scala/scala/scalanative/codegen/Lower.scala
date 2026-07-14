@@ -125,17 +125,193 @@ private[scalanative] object Lower {
     override def onDefn(defn: nir.Defn): nir.Defn = defn match {
       case defn: nir.Defn.Define =>
         val nir.Type.Function(_, ty) = defn.ty
+        val defn1 =
+          if (defn.attrs.isExtern && hasStructShape(defn.ty))
+            coerceExternForwarderBody(defn)
+          else defn
         ScopedVar.scoped(
-          fresh := nir.Fresh(defn.insts),
-          currentDefn := defn,
-          currentDefnGraph := Graph(defn.insts),
+          fresh := nir.Fresh(defn1.insts),
+          currentDefn := defn1,
+          currentDefnGraph := Graph(defn1.insts),
           intrinsicMethods := mutable.Map.empty
         ) {
-          try super.onDefn(defn)
+          try super.onDefn(defn1)
           finally blockInfo.clear()
         }
+      case defn @ nir.Defn.Declare(attrs, name, ty: nir.Type.Function)
+          if attrs.isExtern && !isLlvmIntrinsic(name) && hasStructShape(ty) =>
+        defn.copy(ty = coerceExternFunctionType(ty))(defn.pos)
       case _ =>
         super.onDefn(defn)
+    }
+
+    /** Mirrors the per-param/per-return classification applied to call sites
+     *  in `genAbiCoercedCallOp`, so a `@extern` function's declared LLVM
+     *  signature matches the shape every call to it emits.
+     */
+    private def coerceExternFunctionType(
+        ty: nir.Type.Function
+    ): nir.Type.Function = {
+      val nir.Type.Function(paramTys, retTy) = ty
+      val coercedParams = paramTys.map {
+        case st: nir.Type.StructValue =>
+          abi.StructABI.classify(st)(platform) match {
+            case abi.StructABI.Direct(coerced) => coerced
+            case abi.StructABI.Indirect         => nir.Type.Ptr
+          }
+        case other => other
+      }
+      retTy match {
+        case st: nir.Type.StructValue =>
+          abi.StructABI.classify(st)(platform) match {
+            case abi.StructABI.Direct(coerced) =>
+              nir.Type.Function(coercedParams, coerced)
+            case abi.StructABI.Indirect =>
+              nir.Type.Function(
+                nir.Type.StructReturn(st) +: coercedParams,
+                nir.Type.Unit
+              )
+          }
+        case _ =>
+          nir.Type.Function(coercedParams, retTy)
+      }
+    }
+
+    /** The callee-side mirror of `genAbiCoercedCallOp`/`coerceExternFunctionType`:
+     *  a `CFuncPtr*.fromScalaFunction` forwarder (`genFuncExternForwarder`,
+     *  the only place that emits a `Defn.Define` with `attrs.isExtern`) is a
+     *  genuine C ABI entry point - native code invokes it through a bare
+     *  function pointer using the real calling convention - so its struct
+     *  params/return need exactly the same register-shape coercion applied
+     *  at its call sites, just performed on the callee side: unpack an
+     *  incoming coerced/indirect argument back into the logical struct
+     *  before the body runs, and pack the logical struct result back into
+     *  the coerced/indirect shape before returning. Safe to assume a single
+     *  straight-line entry block with one trailing `Ret`: this Defn is
+     *  hand-built by `genFuncExternForwarder` as a plain call-and-return
+     *  trampoline, never containing branches.
+     */
+    private def coerceExternForwarderBody(
+        defn: nir.Defn.Define
+    ): nir.Defn.Define = {
+      val nir.Type.Function(paramTys, retTy) = defn.ty
+      val nir.Inst.Label(entryId, entryParams) = defn.insts.head: @unchecked
+      val bodyInsts = defn.insts.tail
+      implicit val pos: nir.SourcePosition = defn.pos
+      implicit val fresh: nir.Fresh = nir.Fresh(defn.insts)
+      implicit val scope: nir.ScopeId = nir.ScopeId.TopLevel
+      def unwind = nir.Next.None
+
+      val prelude = new nir.InstructionBuilder()
+      import prelude._
+
+      val substitutions = mutable.Map.empty[nir.Local, nir.Val]
+      val newEntryParams = Seq.newBuilder[nir.Val.Local]
+      entryParams.zip(paramTys).foreach {
+        case (param, st: nir.Type.StructValue) =>
+          abi.StructABI.classify(st)(platform) match {
+            case abi.StructABI.Direct(coerced) =>
+              val newParam = nir.Val.Local(fresh(), coerced)
+              newEntryParams += newParam
+              // `coerced` is the register-width container and can be
+              // larger than the logical struct (e.g. a 4-byte, 4×CChar
+              // struct coerced to a single 8-byte register) - allocate
+              // for `coerced`, not `st`, or the store below overflows
+              // the slot.
+              val tmp = stackalloc(coerced, one, unwind)
+              store(coerced, tmp, newParam, unwind)
+              substitutions(param.id) = load(st, tmp, unwind)
+            case abi.StructABI.Indirect =>
+              val newParam = nir.Val.Local(fresh(), nir.Type.Ptr)
+              newEntryParams += newParam
+              substitutions(param.id) = load(st, newParam, unwind)
+          }
+        case (param, _) =>
+          newEntryParams += param
+      }
+
+      val sretParam = retTy match {
+        case st: nir.Type.StructValue =>
+          abi.StructABI.classify(st)(platform) match {
+            case abi.StructABI.Direct(_) => None
+            case abi.StructABI.Indirect =>
+              val p = nir.Val.Local(fresh(), nir.Type.Ptr)
+              Some(p)
+          }
+        case _ => None
+      }
+
+      val substituted = new nir.Transform {
+        override def onVal(value: nir.Val): nir.Val = value match {
+          case nir.Val.Local(id, _) if substitutions.contains(id) =>
+            substitutions(id)
+          case other => super.onVal(other)
+        }
+      }.onInsts(bodyInsts)
+
+      val finalInsts = retTy match {
+        case st: nir.Type.StructValue =>
+          abi.StructABI.classify(st)(platform) match {
+            case abi.StructABI.Direct(coerced) =>
+              substituted.flatMap {
+                case nir.Inst.Ret(v) =>
+                  val tail = new nir.InstructionBuilder()
+                  import tail._
+                  // Allocate for `coerced` (the register-width container,
+                  // which can be larger than the logical struct), not
+                  // `st` - otherwise the coerced load below overreads
+                  // past the slot.
+                  val tmp = stackalloc(coerced, one, unwind)
+                  store(st, tmp, v, unwind)
+                  val coercedVal = load(coerced, tmp, unwind)
+                  tail += nir.Inst.Ret(coercedVal)
+                  tail.toSeq
+                case other => Seq(other)
+              }
+            case abi.StructABI.Indirect =>
+              val sret = sretParam.get
+              substituted.flatMap {
+                case nir.Inst.Ret(v) =>
+                  val tail = new nir.InstructionBuilder()
+                  import tail._
+                  store(st, sret, v, unwind)
+                  tail += nir.Inst.Ret(nir.Val.Unit)
+                  tail.toSeq
+                case other => Seq(other)
+              }
+          }
+        case _ => substituted
+      }
+
+      val newParamTys = paramTys.map {
+        case st: nir.Type.StructValue =>
+          abi.StructABI.classify(st)(platform) match {
+            case abi.StructABI.Direct(coerced) => coerced
+            case abi.StructABI.Indirect         => nir.Type.Ptr
+          }
+        case other => other
+      }
+      val (finalParamTys, finalRetTy, finalEntryParams) = retTy match {
+        case st: nir.Type.StructValue =>
+          abi.StructABI.classify(st)(platform) match {
+            case abi.StructABI.Direct(coerced) =>
+              (newParamTys, coerced, newEntryParams.result())
+            case abi.StructABI.Indirect =>
+              val sret = sretParam.get
+              (
+                nir.Type.StructReturn(st) +: newParamTys,
+                nir.Type.Unit,
+                sret +: newEntryParams.result()
+              )
+          }
+        case _ => (newParamTys, retTy, newEntryParams.result())
+      }
+
+      val newLabel = nir.Inst.Label(entryId, finalEntryParams)
+      defn.copy(
+        ty = nir.Type.Function(finalParamTys, finalRetTy),
+        insts = (newLabel +: prelude.toSeq) ++ finalInsts
+      )(defn.pos)
     }
 
     override def onType(ty: nir.Type): nir.Type = ty
@@ -1037,22 +1213,125 @@ private[scalanative] object Lower {
         }
     }
 
+    /** LLVM intrinsics (e.g. `llvm.sadd.with.overflow.i32`, which legitimately
+     *  returns a `{ i32, i1 }` `StructValue`) have fixed signatures defined by
+     *  LLVM itself, not subject to C ABI classification - unlike a genuine
+     *  `@extern def`, whose signature is exactly what this pass needs to fix up.
+     */
+    private def isLlvmIntrinsic(name: nir.Global.Member): Boolean =
+      name.sig.unmangled match {
+        case nir.Sig.Extern(id) => id.startsWith("llvm.")
+        case _                  => false
+      }
+
+    private def hasStructShape(ty: nir.Type.Function): Boolean = {
+      val nir.Type.Function(argtys, retty) = ty
+      retty.isInstanceOf[nir.Type.StructValue] ||
+      argtys.exists(_.isInstanceOf[nir.Type.StructValue])
+    }
+
+    /** Rewrites a call to a `@extern` function taking/returning `CStruct*`
+     *  values so the emitted LLVM IR matches the target's real C ABI, since
+     *  LLVM does not classify raw aggregate call arguments/returns against a
+     *  target's calling convention on its own (see `codegen.abi.StructABI`).
+     *  Each struct-shaped param/return is either coerced to a same-size
+     *  ABI-legal register type (`Direct`), or passed/returned indirectly via
+     *  a pointer to a caller-owned temporary (`Indirect`) - `sret` for
+     *  returns (needs the real LLVM attribute since e.g. AAPCS64 places it
+     *  in a dedicated register, x8, not the normal argument sequence),
+     *  plain pointer for args (byval-equivalent by construction: we make the
+     *  defensive copy ourselves, and a plain pointer argument already lands
+     *  in the same register/stack slot an LLVM `byval` pointer would).
+     */
+    private def genAbiCoercedCallOp(
+        buf: nir.InstructionBuilder,
+        n: nir.Local,
+        op: nir.Op.Call
+    )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
+      import buf._
+      val nir.Op.Call(nir.Type.Function(paramTys, retTy), ptr, args) = op
+      val calleeVal = genVal(buf, ptr)
+
+      val coercedArgs = args.zip(paramTys).map {
+        case (argp, st: nir.Type.StructValue) =>
+          val v = genVal(buf, argp)
+          abi.StructABI.classify(st)(platform) match {
+            case abi.StructABI.Direct(coerced) =>
+              // Allocate for `coerced` (the register-width container,
+              // which can be larger than the logical struct - e.g. a
+              // 4-byte, 4×CChar struct coerced to a single 8-byte
+              // register), not `st`, or the coerced load below overreads
+              // past the slot.
+              val tmp = stackalloc(coerced, one, unwind)
+              store(st, tmp, v, unwind)
+              (load(coerced, tmp, unwind), coerced)
+            case abi.StructABI.Indirect =>
+              val tmp = stackalloc(st, one, unwind)
+              store(st, tmp, v, unwind)
+              (tmp, nir.Type.Ptr)
+          }
+        case (argp, pty) =>
+          (genVal(buf, argp), pty)
+      }
+
+      retTy match {
+        case st: nir.Type.StructValue =>
+          abi.StructABI.classify(st)(platform) match {
+            case abi.StructABI.Direct(coerced) =>
+              val newTy = nir.Type.Function(coercedArgs.map(_._2), coerced)
+              val rawResult = buf.let(nir.Op.Call(newTy, calleeVal, coercedArgs.map(_._1)), unwind)
+              val tmp = stackalloc(coerced, one, unwind)
+              store(coerced, tmp, rawResult, unwind)
+              buf.let(n, nir.Op.Load(st, tmp, None), unwind)
+            case abi.StructABI.Indirect =>
+              val resultTmp = stackalloc(st, one, unwind)
+              val newTy = nir.Type.Function(
+                nir.Type.StructReturn(st) +: coercedArgs.map(_._2),
+                nir.Type.Unit
+              )
+              buf.let(nir.Op.Call(newTy, calleeVal, resultTmp +: coercedArgs.map(_._1)), unwind)
+              buf.let(n, nir.Op.Load(st, resultTmp, None), unwind)
+          }
+        case _ =>
+          val newTy = nir.Type.Function(coercedArgs.map(_._2), retTy)
+          buf.let(n, nir.Op.Call(newTy, calleeVal, coercedArgs.map(_._1)), unwind)
+      }
+    }
+
     def genCallOp(
         buf: nir.InstructionBuilder,
         n: nir.Local,
         op: nir.Op.Call
     )(implicit srcPosition: nir.SourcePosition, scopeId: nir.ScopeId): Unit = {
       val nir.Op.Call(ty, ptr, args) = op
+      // A call whose signature mentions a bare `nir.Type.StructValue` is,
+      // by construction, always either an LLVM intrinsic (fixed, non-ABI-
+      // negotiable signature - e.g. `llvm.sadd.with.overflow.i32`) or a
+      // genuine C ABI boundary: a direct call to an `@extern` declaration,
+      // or an indirect call through a `CFuncPtr`'s raw function pointer
+      // (`genCFuncPtrApply`/`genFuncExternForwarder`, both emit args
+      // pre-unboxed to `StructValue` specifically for this boundary).
+      // Regular (non-extern) Scala calls never produce a StructValue-typed
+      // signature. So the only real exclusion needed is LLVM intrinsics -
+      // every other struct-shaped call, direct or indirect, needs coercion.
+      def isLlvmIntrinsicCallee = ptr match {
+        case nir.Val.Global(global: nir.Global.Member, _) =>
+          isLlvmIntrinsic(global)
+        case _ => false
+      }
       def genCall() = {
-        buf.let(
-          n,
-          nir.Op.Call(
-            ty = ty,
-            ptr = genVal(buf, ptr),
-            args = args.map(genVal(buf, _))
-          ),
-          unwind
-        )
+        if (hasStructShape(ty) && !isLlvmIntrinsicCallee)
+          genAbiCoercedCallOp(buf, n, op)
+        else
+          buf.let(
+            n,
+            nir.Op.Call(
+              ty = ty,
+              ptr = genVal(buf, ptr),
+              args = args.map(genVal(buf, _))
+            ),
+            unwind
+          )
       }
 
       def switchThreadState(managed: Boolean) = buf.call(

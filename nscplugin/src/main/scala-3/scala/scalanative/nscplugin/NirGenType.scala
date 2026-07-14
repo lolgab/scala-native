@@ -141,9 +141,11 @@ trait NirGenType(using Context) {
     )
     .toMap
 
-  def genExternType(tpe: Type): nir.Type = {
+  def genExternType(tpe: Type)(using Context): nir.Type = {
     if (tpe.widenDealias.typeSymbol.isCFuncPtrClass)
       nir.Type.Ptr
+    else if (tpe.widenDealias.typeSymbol.isAnonymousStruct)
+      genAnonymousStruct(tpe)
     else
       genType(tpe) match {
         case refty: nir.Type.Ref if nir.Type.boxClasses.contains(refty.name) =>
@@ -156,7 +158,7 @@ trait NirGenType(using Context) {
   inline def genType(
       tpe: Type,
       deconstructValueTypes: Boolean = false
-  ): nir.Type = genNIRType { sym =>
+  )(using Context): nir.Type = genNIRType { sym =>
     PrimitiveSymbolToNirTypes
       .get(sym)
       .getOrElse {
@@ -188,7 +190,7 @@ trait NirGenType(using Context) {
     defnNir.RawSizeClass -> nir.Type.Size
   )
 
-  def genRefType(tpe: Type): nir.Type.RefKind =
+  def genRefType(tpe: Type)(using Context): nir.Type.RefKind =
     genNIRType { sym =>
       if sym.isPrimitiveValueClass then genBoxType(sym.info)
       else if sym == defn.NothingClass then nir.Rt.RuntimeNothing
@@ -200,7 +202,7 @@ trait NirGenType(using Context) {
 
   private def genNIRType[T](toNIRType: Symbol => nir.Type)(
       tpe: Type
-  ): nir.Type = {
+  )(using Context): nir.Type = {
     inline def fromSymbol(sym: Symbol) =
       if sym == defn.AnyClass || sym == defn.ObjectClass then nir.Rt.Object
       else toNIRType(sym)
@@ -238,13 +240,19 @@ trait NirGenType(using Context) {
         .getOrElse(tpe)
     nir.Val.ClassOf(genRefType(refType).className)
 
-  private def genAnonymousStruct(tpe: Type): nir.Type =
+  // Takes an explicit `(using Context)` (rather than relying on the trait's
+  // own constructor-bound given) so that a caller inside
+  // `atPhase(typerPhase) { ... }` propagates its phase-shifted Context all
+  // the way down into field-type resolution. Without this, `tpe.widenDealias`
+  // below would silently fall back to the trait's fixed (post-erasure)
+  // Context, defeating the whole point of the caller's phase travel.
+  private def genAnonymousStruct(tpe: Type)(using Context): nir.Type =
     nir.Type.StructValue(
-      tpe.argTypes
+      tpe.widenDealias.argTypes
         .map(genType(_, deconstructValueTypes = true))
     )
 
-  private def genStruct(tpe: Type): nir.Type = {
+  private def genStruct(tpe: Type)(using Context): nir.Type = {
     // In Scala 2 we used fields to create struct type, but this seems to be broken in Scala 3 -
     // when compiling original file (e.g. in nativelib) we do get correct list of fields,
     // however in the place of usage in other project (e.g. javalib) symbol info does contain only accessors,
@@ -266,7 +274,7 @@ trait NirGenType(using Context) {
     nir.Type.StructValue(ctorParams)
   }
 
-  private def genFixedSizeArray(tpe: Type): nir.Type = {
+  private def genFixedSizeArray(tpe: Type)(using Context): nir.Type = {
     def parseDigit(tpe: Type): Int = {
       val sym = tpe.widenDealias.typeSymbol
       try defnNir.NatBaseClasses.indexOf(sym)
@@ -307,12 +315,72 @@ trait NirGenType(using Context) {
   def genExternMethodSig(sym: Symbol): nir.Type.Function =
     genMethodSigImpl(sym, isExtern = true, statically = true)
 
+  /** True if `tpe` is already a fully-applied `CStruct*` reference (its
+   *  dealiased type carries field type arguments) - as opposed to a bare,
+   *  argument-less reference to the class. Synthetic, non-generic methods
+   *  (e.g. a closure's `$anonfun` method, monomorphic from the start) keep
+   *  their struct field types through erasure with no loss at all; only
+   *  genuinely generic signatures (e.g. a user-written `@extern def`,
+   *  subject to real erasure of `CStruct2[Long, Long]` down to the bare
+   *  class or even `Object`) need the typer-phase recovery below.
+   */
+  def isFullyResolvedStruct(tpe: Type): Boolean = {
+    val d = tpe.widenDealias
+    d.typeSymbol.isAnonymousStruct && d.argTypes.nonEmpty
+  }
+
+  /** sym.info queried at the current (post-erasure) phase loses type
+   *  arguments for ground generic types like `CStruct2[Long, Long]` - for
+   *  parameter positions they come back as the bare, unapplied class type,
+   *  but for a *return* position erasure can go all the way to `Object`
+   *  (no longer even recognizable as a CStruct reference). Re-reading the
+   *  type as it was at typer recovers it in both cases, but going back to
+   *  typer is not generally safe: opaque type aliases (e.g. `Size`) are not
+   *  yet unfolded to their runtime representation there, a polymorphic
+   *  method's pre-erasure info still contains its own (or an enclosing
+   *  scope's) unresolved type parameters, a curried method's pre-erasure
+   *  info is still curried, and - crucially - a symbol synthesized *after*
+   *  typer (closures, bridges, forwarders) has no valid typer-phase
+   *  denotation at all, so phase-travelling to fetch one silently returns
+   *  garbage rather than failing loudly. So: skip typer-phase entirely
+   *  when erasure already preserved the struct's type arguments (the
+   *  synthetic-method case), and only attempt it, carefully, when it
+   *  didn't (the genuinely-erased-generic case) - trusting the result only
+   *  when it's both usable (no free type parameters) and actually
+   *  dealiases to a `CStruct*` class.
+   */
+  private def externReturnNirType(sym: Symbol): nir.Type = {
+    import core.Phases._
+    val erased = sym.info.finalResultType
+    if (isFullyResolvedStruct(erased)) genExternType(erased)
+    else {
+      // Compute the *entire* NIR type while still "at" typer, not just the
+      // top-level dealias: genExternType/genAnonymousStruct recurse into
+      // field types (tpe.widenDealias.argTypes, further genType calls per
+      // field), and those nested lookups are just as phase-sensitive as
+      // the top-level one - pulling a dotty Type value out of atPhase and
+      // only dealiasing *that* still leaves every subsequent operation on
+      // it evaluated at whatever phase happens to be current when the
+      // caller gets around to using it.
+      val atTyper: Option[nir.Type] = atPhase(typerPhase) {
+        val t = sym.info.finalResultType.widenDealias
+        if (
+          t.existsPart(_.isInstanceOf[TypeParamRef]) ||
+          !t.typeSymbol.isAnonymousStruct
+        ) None
+        else Some(genExternType(t))
+      }
+      atTyper.getOrElse(genExternType(erased))
+    }
+  }
+
   private def genMethodSigImpl(
       sym: Symbol,
       isExtern: Boolean,
       statically: Boolean
   ): nir.Type.Function = {
     def resolve() = {
+      import core.Phases._
       require(
         sym.is(Method) || sym.isStatic,
         s"symbol ${sym.owner} $sym is not a method"
@@ -323,11 +391,10 @@ trait NirGenType(using Context) {
       val selfty = Option.unless(statically || isExtern || sym.isStaticInNIR) {
         genType(owner.info.resultType)
       }
-      val resultType = sym.info.resultType
       val retty =
         if (sym.isConstructor) nir.Type.Unit
-        else if (isExtern) genExternType(resultType)
-        else genType(resultType)
+        else if (isExtern) externReturnNirType(sym)
+        else genType(sym.info.resultType)
       nir.Type.Function(selfty ++: paramtys, retty)
     }
 
@@ -358,15 +425,51 @@ trait NirGenType(using Context) {
       }.toMap
     } else Map.empty
 
-    val info = sym.info
-    for {
-      (paramTypes, paramNames) <- info.paramInfoss zip info.paramNamess
-      (paramType, paramName) <- paramTypes zip paramNames
-    } yield {
-      def isRepeated = repeatedParams.getOrElse(paramName, false)
-      if (isExtern && isRepeated) nir.Type.Vararg
-      else if (isExtern) genExternType(paramType)
-      else genType(paramType)
+    val erasedParamTypes = sym.info.paramInfoss.flatten
+    val paramNames = sym.info.paramNamess.flatten
+    // sym.info queried at the current (post-erasure) phase loses type
+    // arguments for ground generic types like `CStruct2[Long, Long]` (they
+    // come back as the bare, unapplied class type). Re-reading it as it was
+    // at typer recovers them, but is only attempted in the one narrow case
+    // that needs it - see externReturnNirType's doc for why going back to
+    // typer isn't safe in general (in particular: skip it entirely when
+    // erasure already preserved every struct param's type arguments, e.g.
+    // for a synthetic, non-generic method such as a closure's `$anonfun`).
+    // Compute the *entire* NIR param type list while still "at" typer, not
+    // just the dealias: genExternType/genAnonymousStruct recurse into
+    // field types, and those nested lookups are just as phase-sensitive as
+    // the top-level one.
+    val needsRecovery = isExtern && !erasedParamTypes.forall(t =>
+      !t.typeSymbol.isAnonymousStruct || isFullyResolvedStruct(t)
+    )
+    val paramNirTypes: Option[Seq[nir.Type]] =
+      if (!needsRecovery) None
+      else
+        atPhase(typerPhase) {
+          val ts = sym.info.paramInfoss.flatten.map(_.widenDealias)
+          if (
+            ts.size != erasedParamTypes.size ||
+            ts.exists(_.existsPart(_.isInstanceOf[TypeParamRef]))
+          ) None
+          else Some(ts.map(genExternType))
+        }
+
+    paramNirTypes match {
+      case Some(nirTypes) =>
+        nirTypes.zip(paramNames).map { case (nirTy, paramName) =>
+          if (isExtern && repeatedParams.getOrElse(paramName, false))
+            nir.Type.Vararg
+          else nirTy
+        }
+      case None =>
+        for {
+          (paramType, paramName) <- erasedParamTypes.zip(paramNames)
+        } yield {
+          def isRepeated = repeatedParams.getOrElse(paramName, false)
+          if (isExtern && isRepeated) nir.Type.Vararg
+          else if (isExtern) genExternType(paramType)
+          else genType(paramType)
+        }
     }
   }
 }

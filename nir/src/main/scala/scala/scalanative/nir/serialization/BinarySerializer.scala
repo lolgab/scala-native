@@ -147,6 +147,8 @@ final class BinarySerializer(channel: WritableByteChannel) {
       case Type.Int128 =>
         nonSerializable("Type.Int128")
       // putTag(T.Int128Type)
+      case Type.StructReturn(_) =>
+        nonSerializable("Type.StructReturn")
     }
   }
 

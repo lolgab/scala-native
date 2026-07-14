@@ -283,7 +283,7 @@ private[codegen] abstract class AbstractCodeGen(
     genGlobal(name)
     str("(")
     if (isDecl) {
-      rep(argtys, sep = ", ")(genType)
+      rep(argtys, sep = ", ")(genFunctionParamType)
     } else {
       insts.head match {
         case nir.Inst.Label(_, params) =>
@@ -332,6 +332,22 @@ private[codegen] abstract class AbstractCodeGen(
 
         copies.clear()
       case _ => unreachable
+    }
+  }
+
+  private[codegen] def genFunctionParamType(
+      ty: nir.Type
+  )(implicit sb: ShowBuilder): Unit = {
+    import sb._
+    ty match {
+      case nir.Type.StructReturn(underlying) =>
+        genType(ty)
+        str(" sret(")
+        genType(underlying)
+        str(") align ")
+        str(MemoryLayout.alignmentOf(underlying))
+      case _ =>
+        genType(ty)
     }
   }
 
@@ -512,7 +528,8 @@ private[codegen] abstract class AbstractCodeGen(
         str("...")
       case nir.Type.Unit =>
         str("void")
-      case _: nir.Type.RefKind | nir.Type.Ptr | nir.Type.Nothing =>
+      case _: nir.Type.RefKind | nir.Type.Ptr | nir.Type.Nothing |
+          _: nir.Type.StructReturn =>
         str(pointerType)
       case nir.Type.Bool          => str("i1")
       case i: nir.Type.FixedSizeI => str("i"); str(i.width)
@@ -1080,7 +1097,9 @@ private[codegen] abstract class AbstractCodeGen(
         str(" @")
         genGlobal(pointee)
         str("(")
-        rep(args, sep = ", ")(genCallArgument)
+        rep(args.zipWithIndex, sep = ", ") { case (arg, i) =>
+          genCallArgument(arg, argtys.applyOrElse(i, (_: Int) => nir.Type.Nothing))
+        }
         str(")")
         if (unwind eq nir.Next.None) genDbgPosition()
         else {
@@ -1097,7 +1116,7 @@ private[codegen] abstract class AbstractCodeGen(
         }
 
       case ptr =>
-        val nir.Type.Function(_, resty) = ty
+        val nir.Type.Function(argtys, resty) = ty
 
         val pointee = fresh()
 
@@ -1123,7 +1142,9 @@ private[codegen] abstract class AbstractCodeGen(
           genLocal(pointee)
         }
         str("(")
-        rep(args, sep = ", ")(genCallArgument)
+        rep(args.zipWithIndex, sep = ", ") { case (arg, i) =>
+          genCallArgument(arg, argtys.applyOrElse(i, (_: Int) => nir.Type.Nothing))
+        }
         str(")")
         if (unwind eq nir.Next.None) genDbgPosition()
         else {
@@ -1158,27 +1179,35 @@ private[codegen] abstract class AbstractCodeGen(
   }
 
   private[codegen] def genCallArgument(
-      v: nir.Val
+      v: nir.Val,
+      declaredTy: nir.Type = nir.Type.Nothing
   )(implicit sb: ShowBuilder): Unit = {
     import sb._
-    v match {
-      case nir.Val.Local(_, refty: nir.Type.RefKind) =>
-        val (nonnull, deref, size) = toDereferenceable(refty)
-        // Primitive unit value cannot be passed as argument, probably BoxedUnit is expected
-        if (refty == nir.Type.Unit) genType(nir.Type.Ptr)
-        else genType(refty)
-        if (nonnull) {
-          str(" nonnull")
-        }
-        str(" ")
-        str(deref)
-        str("(")
-        str(size)
-        str(")")
+    declaredTy match {
+      case nir.Type.StructReturn(underlying) =>
+        genFunctionParamType(declaredTy)
         str(" ")
         genJustVal(v)
       case _ =>
-        genVal(v)
+        v match {
+          case nir.Val.Local(_, refty: nir.Type.RefKind) =>
+            val (nonnull, deref, size) = toDereferenceable(refty)
+            // Primitive unit value cannot be passed as argument, probably BoxedUnit is expected
+            if (refty == nir.Type.Unit) genType(nir.Type.Ptr)
+            else genType(refty)
+            if (nonnull) {
+              str(" nonnull")
+            }
+            str(" ")
+            str(deref)
+            str("(")
+            str(size)
+            str(")")
+            str(" ")
+            genJustVal(v)
+          case _ =>
+            genVal(v)
+        }
     }
   }
 
