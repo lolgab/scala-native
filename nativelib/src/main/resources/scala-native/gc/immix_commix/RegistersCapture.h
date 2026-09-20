@@ -27,6 +27,23 @@ typedef struct {
     void *xmm[16 * 2];
 } RegistersBuffer[1];
 
+#elif (defined(__aarch64__) || defined(__arm64__)) && !defined(_WIN32)
+#define CAPTURE_ARM64
+typedef struct {
+    void *x19;
+    void *x20;
+    void *x21;
+    void *x22;
+    void *x23;
+    void *x24;
+    void *x25;
+    void *x26;
+    void *x27;
+    void *x28;
+    void *fp; // x29
+} RegistersBufferInternal;
+typedef RegistersBufferInternal RegistersBuffer[1];
+
 #else
 #define CAPTURE_SETJMP
 #include <setjmp.h>
@@ -93,6 +110,41 @@ INLINE static void RegistersCapture(RegistersBuffer out) {
     out->r14 = reg14;
     out->r15 = reg15;
 #endif // GNU_C
+
+#elif defined(CAPTURE_ARM64)
+    void *regX19;
+    void *regX20;
+    void *regX21;
+    void *regX22;
+    void *regX23;
+    void *regX24;
+    void *regX25;
+    void *regX26;
+    void *regX27;
+    void *regX28;
+    void *regFp;
+    asm("mov %0, x19\n\t" : "=r"(regX19));
+    asm("mov %0, x20\n\t" : "=r"(regX20));
+    asm("mov %0, x21\n\t" : "=r"(regX21));
+    asm("mov %0, x22\n\t" : "=r"(regX22));
+    asm("mov %0, x23\n\t" : "=r"(regX23));
+    asm("mov %0, x24\n\t" : "=r"(regX24));
+    asm("mov %0, x25\n\t" : "=r"(regX25));
+    asm("mov %0, x26\n\t" : "=r"(regX26));
+    asm("mov %0, x27\n\t" : "=r"(regX27));
+    asm("mov %0, x28\n\t" : "=r"(regX28));
+    asm("mov %0, x29\n\t" : "=r"(regFp));
+    out->x19 = regX19;
+    out->x20 = regX20;
+    out->x21 = regX21;
+    out->x22 = regX22;
+    out->x23 = regX23;
+    out->x24 = regX24;
+    out->x25 = regX25;
+    out->x26 = regX26;
+    out->x27 = regX27;
+    out->x28 = regX28;
+    out->fp = regFp;
 
 #else
 #error "Unable to capture registers state"
